@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"bufio"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -48,14 +50,14 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no available proxy", http.StatusServiceUnavailable)
 			return
 		}
+		tried = append(tried, p.IdentityKey())
 
 		client, err := s.buildClient(p)
 		if err != nil {
-			s.storage.Delete(p.Address)
+			_ = s.storage.DeleteByID(p.ID)
 			continue
 		}
 
-		// 转发请求（使用完整 URL，上游代理通过 client transport 设置）
 		req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
 		if err != nil {
 			continue
@@ -66,19 +68,18 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("[proxy] %s via %s failed, removing", r.RequestURI, p.Address)
-			s.storage.Delete(p.Address)
+			_ = s.storage.DeleteByID(p.ID)
 			continue
 		}
 		defer resp.Body.Close()
 
-		// 写回响应
 		for k, vv := range resp.Header {
 			for _, v := range vv {
 				w.Header().Add(k, v)
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		_, _ = io.Copy(w, resp.Body)
 		if resp.StatusCode == 429 {
 			log.Printf("[proxy] ⚠️  429 %s via %s (protocol=%s)", r.RequestURI, p.Address, p.Protocol)
 		} else {
@@ -99,15 +100,15 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "no available proxy", http.StatusServiceUnavailable)
 			return
 		}
+		tried = append(tried, p.IdentityKey())
 
 		conn, err := s.dialViaProxy(p, r.Host)
 		if err != nil {
 			log.Printf("[tunnel] dial %s via %s failed, removing", r.Host, p.Address)
-			s.storage.Delete(p.Address)
+			_ = s.storage.DeleteByID(p.ID)
 			continue
 		}
 
-		// 告知客户端隧道建立
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
 			conn.Close()
@@ -120,10 +121,9 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		_, _ = fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		log.Printf("[tunnel] %s via %s established", r.Host, p.Address)
 
-		// 双向转发
 		go transfer(conn, clientConn)
 		go transfer(clientConn, conn)
 		return
@@ -140,21 +140,44 @@ func (s *Server) dialViaProxy(p *storage.Proxy, host string) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		// 发送 CONNECT 请求给上游 HTTP 代理
-		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
-		buf := make([]byte, 256)
-		n, err := conn.Read(buf)
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n", host, host); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if header := proxyAuthorizationHeader(p); header != "" {
+			if _, err := fmt.Fprintf(conn, "Proxy-Authorization: %s\r\n", header); err != nil {
+				conn.Close()
+				return nil, err
+			}
+		}
+		if _, err := fmt.Fprintf(conn, "\r\n"); err != nil {
+			conn.Close()
+			return nil, err
+		}
+
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
 		if err != nil {
 			conn.Close()
 			return nil, err
 		}
-		if n < 12 {
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
 			conn.Close()
-			return nil, fmt.Errorf("short response from proxy")
+			return nil, fmt.Errorf("proxy connect failed: %s", resp.Status)
 		}
+		_ = conn.SetDeadline(time.Time{})
 		return conn, nil
 	case "socks5":
-		dialer, err := proxy.SOCKS5("tcp", p.Address, nil, proxy.Direct)
+		var auth *proxy.Auth
+		if p.Username != "" || p.Password != "" {
+			auth = &proxy.Auth{User: p.Username, Password: p.Password}
+		}
+		dialer, err := proxy.SOCKS5("tcp", p.Address, auth, proxy.Direct)
 		if err != nil {
 			return nil, err
 		}
@@ -172,12 +195,19 @@ func (s *Server) buildClient(p *storage.Proxy) (*http.Client, error) {
 		if err != nil {
 			return nil, err
 		}
+		if p.Username != "" || p.Password != "" {
+			proxyURL.User = url.UserPassword(p.Username, p.Password)
+		}
 		return &http.Client{
 			Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
 			Timeout:   timeout,
 		}, nil
 	case "socks5":
-		dialer, err := proxy.SOCKS5("tcp", p.Address, nil, proxy.Direct)
+		var auth *proxy.Auth
+		if p.Username != "" || p.Password != "" {
+			auth = &proxy.Auth{User: p.Username, Password: p.Password}
+		}
+		dialer, err := proxy.SOCKS5("tcp", p.Address, auth, proxy.Direct)
 		if err != nil {
 			return nil, err
 		}
@@ -190,8 +220,16 @@ func (s *Server) buildClient(p *storage.Proxy) (*http.Client, error) {
 	}
 }
 
+func proxyAuthorizationHeader(p *storage.Proxy) string {
+	if p.Username == "" && p.Password == "" {
+		return ""
+	}
+	creds := p.Username + ":" + p.Password
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
+}
+
 func transfer(dst io.WriteCloser, src io.ReadCloser) {
 	defer dst.Close()
 	defer src.Close()
-	io.Copy(dst, src)
+	_, _ = io.Copy(dst, src)
 }

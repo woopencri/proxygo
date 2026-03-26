@@ -184,14 +184,15 @@ function renderPage() {
     document.getElementById('pagination').innerHTML = '';
     return;
   }
-  var html = '<table><thead><tr><th>地址</th><th>协议</th><th>添加时间</th><th>操作</th></tr></thead><tbody>';
+  var html = '<table><thead><tr><th>ID</th><th>地址</th><th>协议</th><th>添加时间</th><th>操作</th></tr></thead><tbody>';
   page.forEach(function(p) {
     var badge = p.Protocol === 'http' ? 'badge-http' : 'badge-socks5';
     var t = new Date(p.CreatedAt).toLocaleString('zh-CN');
-    html += '<tr><td style="font-family:monospace">' + p.Address + '</td>' +
+    html += '<tr><td>' + p.ID + '</td>' +
+      '<td style="font-family:monospace">' + p.Address + '</td>' +
       '<td><span class="badge ' + badge + '">' + p.Protocol + '</span></td>' +
       '<td>' + t + '</td>' +
-      '<td><button class="btn btn-danger" onclick="deleteProxy(\'' + p.Address + '\')">删除</button></td></tr>';
+      '<td><button class="btn btn-danger" onclick="deleteProxy(' + p.ID + ', ' + JSON.stringify(p.Address) + ')">删除</button></td></tr>';
   });
   html += '</tbody></table>';
   document.getElementById('proxy-table-wrap').innerHTML = html;
@@ -213,9 +214,9 @@ function goPage(p) {
   renderPage();
 }
 
-async function deleteProxy(address) {
+async function deleteProxy(id, address) {
   if (!confirm('确认删除 ' + address + ' ?')) return;
-  await api('/api/proxy/delete', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:address})});
+  await api('/api/proxy/delete', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
   loadProxies();
   loadStats();
 }

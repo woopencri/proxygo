@@ -163,13 +163,16 @@ func (s *Server) apiDeleteProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Address string `json:"address"`
+		ID int64 `json:"id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID <= 0 {
 		jsonError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	s.storage.Delete(req.Address)
+	if err := s.storage.DeleteByID(req.ID); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	jsonOK(w, map[string]string{"status": "deleted"})
 }
 
@@ -191,10 +194,10 @@ func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	if r.Method == http.MethodGet {
 		jsonOK(w, map[string]interface{}{
-			"fetch_interval":        cfg.FetchInterval,
-			"check_interval":        cfg.CheckInterval,
-			"validate_concurrency":  cfg.ValidateConcurrency,
-			"validate_timeout":      cfg.ValidateTimeout,
+			"fetch_interval":       cfg.FetchInterval,
+			"check_interval":       cfg.CheckInterval,
+			"validate_concurrency": cfg.ValidateConcurrency,
+			"validate_timeout":     cfg.ValidateTimeout,
 		})
 		return
 	}
@@ -220,7 +223,6 @@ func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "save config error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// 通知定时器重置
 	select {
 	case s.configChanged <- struct{}{}:
 	default:
@@ -232,11 +234,11 @@ func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 
 func jsonOK(w http.ResponseWriter, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }

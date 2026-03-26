@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -31,8 +32,23 @@ type Fetcher struct {
 }
 
 func New(httpURL, socks5URL string) *Fetcher {
+	sources := make([]Source, 0, len(defaultSources))
+	if strings.TrimSpace(httpURL) != "" {
+		sources = append(sources, Source{URL: strings.TrimSpace(httpURL), Protocol: "http"})
+	} else {
+		sources = append(sources, defaultSources[0])
+	}
+	if strings.TrimSpace(socks5URL) != "" {
+		sources = append(sources, Source{URL: strings.TrimSpace(socks5URL), Protocol: "socks5"})
+	} else {
+		sources = append(sources, defaultSources[1])
+	}
+	if len(defaultSources) > 2 {
+		sources = append(sources, defaultSources[2:]...)
+	}
+
 	return &Fetcher{
-		sources: defaultSources,
+		sources: sources,
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -50,7 +66,7 @@ func (f *Fetcher) Fetch() ([]storage.Proxy, error) {
 	ch := make(chan result, len(f.sources))
 	for _, src := range f.sources {
 		go func(s Source) {
-			proxies, err := f.fetchFromURL(s.URL, s.Protocol)
+			proxies, err := f.fetchFromSource(s.URL, s.Protocol)
 			ch <- result{proxies: proxies, source: s, err: err}
 		}(src)
 	}
@@ -63,11 +79,11 @@ func (f *Fetcher) Fetch() ([]storage.Proxy, error) {
 			log.Printf("fetch %s error: %v", r.source.URL, r.err)
 			continue
 		}
-		// 去重
 		var deduped []storage.Proxy
 		for _, p := range r.proxies {
-			if !seen[p.Address] {
-				seen[p.Address] = true
+			key := p.IdentityKey()
+			if !seen[key] {
+				seen[key] = true
 				deduped = append(deduped, p)
 			}
 		}
@@ -82,18 +98,42 @@ func (f *Fetcher) Fetch() ([]storage.Proxy, error) {
 	return all, nil
 }
 
-func (f *Fetcher) fetchFromURL(url, protocol string) ([]storage.Proxy, error) {
-	resp, err := f.client.Get(url)
+func (f *Fetcher) fetchFromSource(source, protocol string) ([]storage.Proxy, error) {
+	reader, closeFn, err := f.openSource(source)
 	if err != nil {
-		return nil, fmt.Errorf("get %s: %w", url, err)
+		return nil, err
 	}
-	defer resp.Body.Close()
+	defer closeFn()
+	return parseProxyList(reader, protocol)
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
+func (f *Fetcher) openSource(source string) (io.Reader, func(), error) {
+	source = strings.TrimSpace(source)
+	switch {
+	case strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://"):
+		resp, err := f.client.Get(source)
+		if err != nil {
+			return nil, nil, fmt.Errorf("get %s: %w", source, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return nil, nil, fmt.Errorf("unexpected status %d from %s", resp.StatusCode, source)
+		}
+		return resp.Body, func() { _ = resp.Body.Close() }, nil
+	case strings.HasPrefix(source, "file://"):
+		path := strings.TrimPrefix(source, "file://")
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open %s: %w", path, err)
+		}
+		return file, func() { _ = file.Close() }, nil
+	default:
+		file, err := os.Open(source)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open %s: %w", source, err)
+		}
+		return file, func() { _ = file.Close() }, nil
 	}
-
-	return parseProxyList(resp.Body, protocol)
 }
 
 func parseProxyList(r io.Reader, protocol string) ([]storage.Proxy, error) {
@@ -104,25 +144,42 @@ func parseProxyList(r io.Reader, protocol string) ([]storage.Proxy, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		addr := line
-		proto := protocol
-		// 支持 protocol://host:port 格式
-		if idx := strings.Index(line, "://"); idx != -1 {
-			proto = line[:idx]
-			addr = line[idx+3:]
-			// socks4 当 socks5 处理
-			if proto == "socks4" {
-				proto = "socks5"
-			}
-		}
-		parts := strings.Split(addr, ":")
-		if len(parts) != 2 {
+
+		p, ok := parseProxyLine(line, protocol)
+		if !ok {
 			continue
 		}
-		proxies = append(proxies, storage.Proxy{
-			Address:  addr,
-			Protocol: proto,
-		})
+		proxies = append(proxies, p)
 	}
 	return proxies, scanner.Err()
+}
+
+func parseProxyLine(line, defaultProtocol string) (storage.Proxy, bool) {
+	addr := line
+	proto := strings.ToLower(strings.TrimSpace(defaultProtocol))
+	if idx := strings.Index(line, "://"); idx != -1 {
+		proto = strings.ToLower(strings.TrimSpace(line[:idx]))
+		addr = strings.TrimSpace(line[idx+3:])
+	}
+	if proto == "socks4" {
+		proto = "socks5"
+	}
+
+	parts := strings.Split(addr, ":")
+	switch len(parts) {
+	case 2:
+		return storage.Proxy{
+			Address:  parts[0] + ":" + parts[1],
+			Protocol: proto,
+		}, true
+	case 4:
+		return storage.Proxy{
+			Address:  parts[0] + ":" + parts[1],
+			Protocol: proto,
+			Username: parts[2],
+			Password: parts[3],
+		}, true
+	default:
+		return storage.Proxy{}, false
+	}
 }

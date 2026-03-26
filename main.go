@@ -100,7 +100,7 @@ func fetchAndValidate(fetch *fetcher.Fetcher, store *storage.Storage) error {
 				log.Printf("[main] first valid proxy: %s (%s) latency=%v", r.Proxy.Address, r.Proxy.Protocol, r.Latency)
 			}
 			valid++
-			if err := store.AddProxy(r.Proxy.Address, r.Proxy.Protocol); err != nil {
+			if err := store.AddProxy(r.Proxy.Address, r.Proxy.Protocol, r.Proxy.Username, r.Proxy.Password); err != nil {
 				log.Printf("[main] addProxy error: %v", err)
 			}
 			if valid%10 == 0 {

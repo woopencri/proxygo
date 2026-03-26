@@ -41,7 +41,6 @@ func (c *Checker) run() {
 		return
 	}
 
-	// 每次用最新配置创建 validator
 	cfg := config.Get()
 	validate := validator.New(cfg.ValidateConcurrency, cfg.ValidateTimeout, cfg.ValidateURL)
 
@@ -54,7 +53,7 @@ func (c *Checker) run() {
 			valid++
 		} else {
 			invalid++
-			if err := c.storage.Delete(r.Proxy.Address); err != nil {
+			if err := c.storage.DeleteByID(r.Proxy.ID); err != nil {
 				log.Printf("[checker] delete error: %v", err)
 			}
 		}

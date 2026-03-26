@@ -88,9 +88,9 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration) {
 
 	switch p.Protocol {
 	case "http":
-		client, err = newHTTPClient(p.Address, v.timeout)
+		client, err = newHTTPClient(p.Address, p.Username, p.Password, v.timeout)
 	case "socks5":
-		client, err = newSOCKS5Client(p.Address, v.timeout)
+		client, err = newSOCKS5Client(p.Address, p.Username, p.Password, v.timeout)
 	default:
 		log.Printf("unknown protocol %s for %s", p.Protocol, p.Address)
 		return false, 0
@@ -109,12 +109,10 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration) {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
-	// 验证状态码（200 或 204 都接受）
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return false, latency
 	}
 
-	// 响应时间过滤
 	if v.maxResponseMs > 0 && latency > time.Duration(v.maxResponseMs)*time.Millisecond {
 		return false, latency
 	}
@@ -122,10 +120,13 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration) {
 	return true, latency
 }
 
-func newHTTPClient(address string, timeout time.Duration) (*http.Client, error) {
+func newHTTPClient(address, username, password string, timeout time.Duration) (*http.Client, error) {
 	proxyURL, err := url.Parse(fmt.Sprintf("http://%s", address))
 	if err != nil {
 		return nil, err
+	}
+	if username != "" || password != "" {
+		proxyURL.User = url.UserPassword(username, password)
 	}
 	return &http.Client{
 		Transport: &http.Transport{
@@ -135,8 +136,12 @@ func newHTTPClient(address string, timeout time.Duration) (*http.Client, error) 
 	}, nil
 }
 
-func newSOCKS5Client(address string, timeout time.Duration) (*http.Client, error) {
-	dialer, err := proxy.SOCKS5("tcp", address, nil, proxy.Direct)
+func newSOCKS5Client(address, username, password string, timeout time.Duration) (*http.Client, error) {
+	var auth *proxy.Auth
+	if username != "" || password != "" {
+		auth = &proxy.Auth{User: username, Password: password}
+	}
+	dialer, err := proxy.SOCKS5("tcp", address, auth, proxy.Direct)
 	if err != nil {
 		return nil, err
 	}
